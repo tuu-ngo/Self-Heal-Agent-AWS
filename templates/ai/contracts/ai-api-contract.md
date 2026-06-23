@@ -1,148 +1,49 @@
-# AI API Contract - Task force <N>
+# 1. Luồng Cốt Lõi (Core Pipeline)
+Tài liệu này định nghĩa một quy trình tự động hóa khép kín (closed-loop automation) bao gồm 4 bước bắt buộc:
 
-<!-- Owner: Nhóm AI <N>
-     Signed by: AI Lead + CDO Leads × 2-3 + Reviewer panel
-     Date signed: 2026-06-25 (W11 T5)
-     🔒 FREEZE - no change without formal change request -->
+* **Detect (Phát hiện)**: Hệ thống giám sát đẩy dữ liệu telemetry vào API `/v1/detect`.
+* **Decide (Ra quyết định)**: Hạ tầng mang cảnh báo đó gọi `/v1/decide` để lấy kịch bản xử lý.
+* **Execute (Thực thi)**: CDO tự động chạy các lệnh hạ tầng (không nằm trong API này).
+* **Verify (Xác minh)**: CDO gọi `/v1/verify` để AI đánh giá xem sự cố đã được khắc phục hoàn toàn hay chưa.
 
-## Mục đích
+# 2. Quy Tắc Chung & Tính Lũy Đẳng (Idempotency)
 
-Định nghĩa **API endpoints** mà Nhóm AI expose, Nhóm CDO consume. Là service contract giữa AI engine và platform infra.
+### Bảo mật và Môi trường
+* **Authentication**: Mọi kết nối liên dịch vụ phải được ký bằng IAM SigV4.
+* **Offline Simulation**: Vì đang dùng dữ liệu tĩnh (dataset RE2/RE3), CDO sẽ gửi các mốc thời gian giả lập vào `post_telemetry_window` để AI kiểm tra, và `tenant_id` sẽ được chèn các chuỗi định danh mô phỏng (ví dụ: `tnt-re3-simulation`).
 
-## Versioning
+### Bản chất thực tế của Idempotency (Tính lũy đẳng)
+Đối với các API thay đổi trạng thái hạ tầng (`/v1/decide` và `/v1/verify`), CDO bắt buộc phải đính kèm một `Idempotency-Key` (UUID v4). Cơ chế này để ngăn chặn rủi ro hệ thống thực thi trùng lặp một lệnh (duplicate execution) khi xảy ra sự cố về mạng (network timeout/retries).
 
-- **Current version**: `v1.0` (in path `/v1/`)
-- **Breaking changes** → new version path `/v2/`, both versions support cùng lúc tối thiểu 30 ngày
-- **Non-breaking** (add optional field, add new endpoint) → minor bump, no path change
+Kịch bản thực tế diễn ra như sau:
+* **Bước 1**: CDO Platform gọi API POST `/v1/decide` để xin kịch bản xử lý lỗi, gửi kèm header `Idempotency-Key: 123...`.
+* **Bước 2**: AI Engine chạy thuật toán xong và quyết định xuất ra lệnh `RESTART_DEPLOYMENT`.
+* **Bước 3 (Sự cố mạng)**: Đúng lúc AI chuẩn bị trả kết quả thì đường truyền bị gián đoạn (timeout). AI đã xử lý xong nhưng CDO chưa nhận được kết quả.
+* **Bước 4 (CDO Retry)**: Vì không nhận được phản hồi, CDO tự động gọi lại API (retry). Điểm mấu chốt là CDO vẫn giữ nguyên mã `Idempotency-Key: 123...` như lần đầu.
+* **Bước 5 (AI Xử lý)**: AI Engine đọc header này, tra cứu trong cache và nhận ra request này đã được xử lý. Nhờ đó, AI không chạy lại thuật toán, chỉ đơn giản trả lại đúng kết quả `RESTART_DEPLOYMENT` đã lưu từ lần trước.
 
-## Authentication
+Nếu thiếu key này, AI có thể vô tình phát lệnh restart 2 lần liên tiếp, gây sập dịch vụ nặng hơn. Ngoài ra, nếu CDO gửi request thứ 2 khi request 1 vẫn đang chạy, AI sẽ trả mã `409 Conflict` để chặn lại.
 
-- **Inter-service**: IAM SigV4 (no API keys)
-- **Cross-account**: STS assume-role với session tag `tenant_id`
-- **Audit**: every auth event logged
+# 3. Đặc Tả 3 API Endpoints
 
-## Rate limiting
+### 1. POST /v1/detect (Nhận diện sự cố)
+* **Đầu vào**: CDO gửi mảng `telemetry_window` chứa các điểm dữ liệu (datapoints) tại thời điểm hệ thống có biến động (bao gồm timestamp, tên tín hiệu, giá trị metric hoặc log).
+* **Đầu ra**: AI phân tích và trả về cờ `anomaly_detected`. Quan trọng nhất, AI cấp một `correlation_id` (định danh phiên theo dõi sự cố) để liên kết toàn bộ chuỗi hành động sau này.
 
-- **Per tenant**: N requests/minute (config trong API Gateway usage plan)
-- **Global**: M requests/minute (circuit breaker nếu vượt)
-- **Response on hit**: `429` với header `Retry-After: <seconds>`
+### 2. POST /v1/decide (Đưa ra chiến lược)
+* **Đầu vào**: CDO cung cấp `correlation_id` và ngữ cảnh lỗi từ bước trước. Chú ý cờ `dry_run_mode` để kiểm thử logic mà không kích hoạt hạ tầng thật.
+* **Đầu ra**:
+  * `action_plan`: Một mảng chứa trình tự các lệnh hạ tầng (ví dụ: `RESTART_DEPLOYMENT`, `SCALE_UP_PODS`).
+  * `blast_radius_config`: Ràng buộc giới hạn sát thương. Ví dụ: AI chỉ cho phép khởi động lại tối đa một tỷ lệ phần trăm Pod nhất định (`max_pod_impact_pct`). Nếu lỗi vượt ngưỡng (`circuit_breaker_error_rate`), CDO phải tự ngắt tự động hóa.
 
----
+### 3. POST /v1/verify (Xác minh hậu thực thi)
+* **Đầu vào**: CDO gửi trạng thái lệnh vừa chạy (`action_executed`) kèm theo cửa sổ dữ liệu metrics thu thập được sau khi lệnh đã thực thi (`post_telemetry_window`).
+* **Đầu ra**: AI đánh giá xem hệ thống đã ổn định chưa (`success: true`) hoặc có phát sinh suy giảm hiệu năng mới không (`regression_detected`). Nếu mọi nỗ lực thất bại, AI trả lệnh `ESCALATE` kèm theo một `escalation_bundle` chứa toàn bộ log/context để CDO bắn thẳng cảnh báo lên kênh Slack cho kỹ sư.
 
-## Endpoint 1: `POST /v1/detect`
+# 4. Cam Kết SLAs & Xử Lý Mã Lỗi (Error Handling)
+Tài liệu quy định ranh giới trách nhiệm rất rõ ràng qua các mã HTTP Status để tránh hai team đổ lỗi cho nhau:
 
-**Mục đích**: detect anomaly + suggest action từ telemetry signals.
-
-### Request headers
-
-| Header | Type | Required | Description |
-|---|---|---|---|
-| `X-Tenant-Id` | UUID v4 | ✓ | Tenant identifier |
-| `Authorization` | IAM SigV4 | ✓ | Inter-service auth |
-| `X-Correlation-Id` | UUID | optional | Trace correlation (auto-generated nếu thiếu) |
-
-### Request body
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `signal_window` | array | ✓ | Time-series datapoints (xem Telemetry Contract) |
-| `signal_window[].ts` | RFC3339 | ✓ | Event timestamp UTC |
-| `signal_window[].signal_name` | string | ✓ | Tên signal (khớp với Telemetry Contract) |
-| `signal_window[].value` | float | ✓ | Measurement value |
-| `signal_window[].labels` | object | optional | Additional context labels |
-| `context.deployment_version` | string | ✓ | Current deploy SHA hoặc version tag |
-| `context.time_range.start_ts` | RFC3339 | ✓ | Analysis window start |
-| `context.time_range.end_ts` | RFC3339 | ✓ | Analysis window end |
-
-**Request example**:
-
-```json
-{
-  "signal_window": [
-    {"ts": "2026-06-25T10:00:00Z", "signal_name": "api_latency_ms", "value": 1200},
-    {"ts": "2026-06-25T10:01:00Z", "signal_name": "api_latency_ms", "value": 1800}
-  ],
-  "context": {
-    "deployment_version": "v2.3.1",
-    "time_range": {
-      "start_ts": "2026-06-25T09:55:00Z",
-      "end_ts": "2026-06-25T10:01:00Z"
-    }
-  }
-}
-```
-
-### Response body
-
-| Field | Type | Description |
-|---|---|---|
-| `anomaly` | bool | True nếu detect anomaly |
-| `severity` | float 0.0-1.0 | Severity score |
-| `suggested_action` | enum | `SCALE_UP` / `ROLLBACK` / `ALERT_ONLY` / `INVESTIGATE` |
-| `reasoning` | string (≤300 chars) | Human-readable rationale |
-| `confidence` | float 0.0-1.0 | Model confidence - CDO dùng cho gating |
-| `audit_id` | UUID | Reference cho audit trail lookup |
-
-**Response example**:
-
-```json
-{
-  "anomaly": true,
-  "severity": 0.78,
-  "suggested_action": "SCALE_UP",
-  "reasoning": "Latency tăng 50% trong 1 phút sau deploy v2.3.1 - likely correlated.",
-  "confidence": 0.82,
-  "audit_id": "audit-xyz789"
-}
-```
-
-### SLA
-
-| Metric | Target |
-|---|---|
-| P99 latency | < 500 ms |
-| Throughput | 100 RPS |
-| Availability | 99.5% |
-
-### Error codes
-
-| Code | Meaning | CDO action |
-|---|---|---|
-| `400` | Invalid input schema | Fix client code, KHÔNG retry |
-| `401` | Auth failed | Refresh credential, retry once |
-| `429` | Rate-limited | Exponential backoff (1s → 2s → 4s ...) |
-| `503` | AI engine unavailable | Fallback to rule-based alert (CDO **bắt buộc** có fallback path) |
-
----
-
-## Endpoint 2: `POST /v1/verify`
-
-**Mục đích**: verify state sau khi CDO execute 1 action (chỉ dùng cho engine type Self-Heal có action).
-
-### Request body
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `action_taken.type` | enum | ✓ | Action type đã execute |
-| `action_taken.params` | object | ✓ | Params dùng cho action |
-| `action_taken.ts` | RFC3339 | ✓ | Khi action execute |
-| `post_state.signal_window` | array | ✓ | Signals sau action (verify window) |
-
-### Response body
-
-| Field | Type | Description |
-|---|---|---|
-| `success` | bool | Action có thành công không |
-| `regression_detected` | bool | Có regression nào không (vd metric khác bị tệ đi) |
-| `next_action` | enum | `DONE` / `RETRY` / `ESCALATE` |
-
-### SLA
-
-- P99 latency < 800 ms
-
----
-
-## Open questions
-
-- [ ] Q1: Có cần endpoint streaming/SSE cho realtime monitoring không?
-- [ ] Q2: Webhook callback từ AI sang CDO khi async - có cần không?
+* **P99 Latency**: Hệ thống phải phản hồi dưới 500ms cho các API quyết định. Rate limit tối đa 120 req/min.
+* **400 Bad Request**: CDO map sai schema JSON. CDO phải tự log và sửa code, tuyệt đối không tự động retry.
+* **429 Too Many Requests**: Vượt quota. CDO phải thiết kế thuật toán Exponential Backoff (tăng dần thời gian chờ) trước khi thử lại.
+* **503 Service Unavailable**: AI bị sập (engine crash). Đây là điểm chí mạng: CDO bắt buộc phải thiết kế luồng fallback nội bộ (ví dụ: tự động chạy một script runbook tĩnh dự phòng, hoặc bắn ngay alert cho SRE) thay vì để hệ thống tê liệt.
